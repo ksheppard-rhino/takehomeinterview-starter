@@ -19,6 +19,19 @@ function Test-Cmd([string]$Name) {
     $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Wait-ForUrl([string]$Url, [int]$Attempts) {
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5
+            if ($response.StatusCode -eq 200) { return $true }
+        } catch {
+            # Not up yet.
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
 function Test-PortInUse([int]$Port) {
     $pattern = ":$Port\s+\S+\s+LISTENING"
     $matches = netstat -ano -p tcp 2>$null | Select-String -Pattern $pattern
@@ -112,22 +125,68 @@ foreach ($port in 3000, 8000) {
 }
 
 Write-Host ""
-Write-Host "Building images (this is the slow part -- doing it now saves later waits)"
-if ($Fail -eq 0) {
-    if (-not (Test-Path -LiteralPath "docker-compose.yml")) {
-        Write-Fail "docker-compose.yml not found -- run this script from the repo root"
+Write-Host "Stack (build, start, check, stop -- this is the slow part)"
+if ($Fail -ne 0) {
+    Write-Warn "skipped -- fix the failures above first"
+} elseif (-not (Test-Path -LiteralPath "docker-compose.yml")) {
+    Write-Fail "docker-compose.yml not found -- run this script from the repo root"
+} else {
+    $log = Join-Path $env:TEMP "preflight-stack.log"
+    docker compose up --build -d *> $log
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "'docker compose up --build -d' failed -- see $log"
+        Get-Content -LiteralPath $log -Tail 20
     } else {
-        $log = Join-Path $env:TEMP "preflight-build.log"
-        docker compose build *> $log
-        if ($LASTEXITCODE -eq 0) {
-            Write-Pass "docker images built"
+        Write-Pass "images built and containers started"
+
+        $apiOk = Wait-ForUrl "http://127.0.0.1:8000/api/health" 60
+        if ($apiOk) {
+            Write-Pass "API answered on http://127.0.0.1:8000/api/health"
         } else {
-            Write-Fail "docker build failed -- see $log"
-            Get-Content -LiteralPath $log -Tail 20
+            Write-Fail "API did not answer within 120s"
+        }
+
+        $webOk = Wait-ForUrl "http://127.0.0.1:3000/" 30
+        if ($webOk) {
+            Write-Pass "frontend answered on http://127.0.0.1:3000"
+        } else {
+            Write-Fail "frontend did not answer within 60s"
+        }
+
+        if (-not ($apiOk -and $webOk)) {
+            docker compose logs --no-color --tail 40 *>> $log
+            Write-Host "  --- last 40 log lines (full log: $log) ---"
+            Get-Content -LiteralPath $log -Tail 40
+        }
+
+        docker compose down *>> $log
+        if ($LASTEXITCODE -eq 0) {
+            Write-Pass "stack stopped (database volume kept)"
+        } else {
+            Write-Fail "'docker compose down' failed -- see $log"
         }
     }
-} else {
-    Write-Warn "skipped -- fix the failures above first"
+}
+
+Write-Host ""
+Write-Host "Screen sharing (Zoom or Chrome Remote Desktop -- either one is enough)"
+$zoomFound = $false
+foreach ($base in @($env:APPDATA, $env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not $base) { continue }
+    if (Test-Path -LiteralPath (Join-Path $base "Zoom\bin\Zoom.exe")) { $zoomFound = $true }
+}
+$crdFound = $false
+foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not $base) { continue }
+    if (Test-Path -LiteralPath (Join-Path $base "Google\Chrome Remote Desktop")) { $crdFound = $true }
+}
+if (Get-Service -Name "chromoting" -ErrorAction SilentlyContinue) { $crdFound = $true }
+
+if ($zoomFound) { Write-Pass "Zoom found" }
+if ($crdFound) { Write-Pass "Chrome Remote Desktop found" }
+if (-not ($zoomFound -or $crdFound)) {
+    Write-Fail "neither Zoom nor Chrome Remote Desktop found -- install one of them"
+    Write-Warn "if you do have one installed somewhere unusual, tell us and ignore this"
 }
 
 Write-Host ""
